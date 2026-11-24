@@ -6,8 +6,8 @@
 
 ## Overview
 
-Plugin submodules own production patches, business tests, and plugin license inputs.
-The common build downloads the selected upstream tag and combines active plugin submodules in one temporary source tree.
+Root-tracked plugin directories and plugin submodules own production patches, business tests, and plugin license inputs.
+The common build downloads the selected upstream tag and combines active plugins in one temporary source tree.
 An initialized plugin with no top-level `patches/*.patch` files contributes no patches, tests, or licenses to that build.
 This repository has no root Go module or shared-library entry point.
 The user package replaces the server binary without compilation on the installation host.
@@ -53,11 +53,11 @@ Keep installer tests out of production source and keep the raw server as a local
 
 Private configuration and reusable dependency caches remain outside source and package inputs.
 Keep user instructions in `README.md`. Do not create a separate `docs/` tree or source overlay.
-Only the parent repository owns `.trellis/` and AI-assistant scaffolding. Keep plugin submodules free of nested `.trellis/` or agent directories.
+Only the parent repository owns `.trellis/` and AI-assistant scaffolding. Keep plugin directories free of nested `.trellis/` or agent directories.
 
 Each plugin and the template carry the complete build script, installer source, flat common tests, and license inputs.
 Local builds and CI both run `python3 scripts/build.py` without arguments or external build Actions.
-Standalone roots apply only their own patches. The parent applies active submodule patches in sorted order.
+Standalone roots apply only their own patches. The parent applies active plugin patches in sorted path order.
 Keep equivalent build-kit files aligned. Run common cases once per build, not once per combined plugin.
 All repositories produce versioned executable pairs under `dist/build/<os>-<arch>/`.
 Names use `sub2api-plugins-[installer-]<upstream-tag>-<os>-<arch>`, where `installer-` is present only for installers.
@@ -96,13 +96,12 @@ The quota plugin lives at `plugins/sub2api-quota-extension`.
 Its [production patch](../../../plugins/sub2api-quota-extension/patches/quota-extension.patch) extends native account usage.
 See [API Key Account Usage](./api-key-quota.md) for its service and frontend contracts.
 
-The Gemini plugin lives at `plugins/gemini-signature-rectifier`.
-Its [production patch](../../../plugins/gemini-signature-rectifier/patches/gemini-signature-rectifier.patch) extends native Gemini recovery and rectifier settings.
-Its four flat business suites cover native recovery, settings service, settings handler, and the settings UI:
+The Gemini plugin snapshot lives at `plugins/gemini-signature-rectifier`.
+It currently has no production patch and is skipped by the combined build, including its tests and licenses.
+Restore a reviewed upstream-compatible patch before re-enabling it.
 
 ```text
 plugins/gemini-signature-rectifier/
-├── patches/gemini-signature-rectifier.patch
 └── tests/
     ├── test_gemini_native_signature_rectifier_test.go
     ├── test_rectifier_settings_test.go

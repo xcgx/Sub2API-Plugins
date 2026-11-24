@@ -1,0 +1,1550 @@
+diff --git a/backend/internal/codexeval/inspection.go b/backend/internal/codexeval/inspection.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..406095f91a141db520695b16661b6781d3369b6e
+--- /dev/null
++++ b/backend/internal/codexeval/inspection.go
+@@ -0,0 +1,829 @@
++package codexeval
++
++import (
++	"context"
++	"fmt"
++	"math/rand/v2"
++	"path"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++)
++
++type InspectionVerdict string
++
++const (
++	InspectionVerdictNormal   InspectionVerdict = "normal"
++	InspectionVerdictDegraded InspectionVerdict = "degraded"
++)
++
++type InspectionAccount struct {
++	Target
++	Name                  string
++	Email                 string `json:"email,omitempty"`
++	Platform              string `json:"platform,omitempty"`
++	Priority              int
++	Verdict               InspectionVerdict
++	Available             bool
++	GroupIDs              []int64
++	Type                  string
++	PlanType              string
++	Enabled               bool
++	AutoInspectionEnabled bool
++}
++
++type InspectionHooks struct {
++	Load           func(context.Context) (InspectionSettings, error)
++	List           func(context.Context, InspectionSettings) ([]InspectionAccount, error)
++	Get            func(context.Context, int64) (InspectionAccount, error)
++	PersistVerdict func(context.Context, int64, InspectionVerdict, InspectionSettings) error
++	UpdatePriority func(context.Context, int64, int) error
++	Notify         func(context.Context, InspectionSettings, string, string) error
++}
++
++type InspectionResult struct {
++	AccountID         int64    `json:"account_id"`
++	AccountName       string   `json:"account_name"`
++	Priority          int      `json:"priority"`
++	TargetPriority    *int     `json:"target_priority,omitempty"`
++	RunIDs            []string `json:"run_ids"`
++	Tests             int      `json:"tests"`
++	Outcome           string   `json:"outcome"`
++	Error             string   `json:"error,omitempty"`
++	NotificationError string   `json:"notification_error,omitempty"`
++}
++
++type InspectionState struct {
++	Enabled    bool               `json:"enabled"`
++	Running    bool               `json:"running"`
++	Cancelling bool               `json:"cancelling"`
++	Phase      string             `json:"phase"`
++	NextRunAt  *time.Time         `json:"next_run_at"`
++	StartedAt  *time.Time         `json:"started_at"`
++	FinishedAt *time.Time         `json:"finished_at"`
++	Total      int                `json:"total"`
++	Done       int                `json:"done"`
++	Error      string             `json:"error"`
++	Results    []InspectionResult `json:"results"`
++}
++
++type inspector struct {
++	mu             sync.Mutex
++	settings       InspectionSettings
++	settingsLoaded bool
++	hooks          InspectionHooks
++	state          InspectionState
++	ctx            context.Context
++	cancel         context.CancelFunc
++	runCancel      context.CancelFunc
++	wake           chan struct{}
++	done           chan struct{}
++	runDone        chan struct{}
++	poll           time.Duration
++	recovery       time.Duration
++	phaseLimit     time.Duration
++}
++
++var inspection *inspector
++
++func InitializeInspection(hooks InspectionHooks) {
++	i := newInspector(hooks)
++	i.loadInitialSettings()
++	inspection = i
++	go i.loop()
++}
++
++func newInspector(hooks InspectionHooks) *inspector {
++	ctx, cancel := context.WithCancel(context.Background())
++	i := &inspector{hooks: hooks, settings: DefaultInspectionSettings(), ctx: ctx, cancel: cancel,
++		wake: make(chan struct{}, 1), done: make(chan struct{}), poll: 15 * time.Second, recovery: 240 * time.Second, phaseLimit: 30 * time.Minute}
++	i.state = InspectionState{Phase: "idle", Results: []InspectionResult{}}
++	return i
++}
++
++func StopInspection() {
++	if inspection == nil {
++		return
++	}
++	inspection.cancel()
++	<-inspection.done
++}
++
++func UpdateInspectionSettings(s InspectionSettings) {
++	if inspection != nil {
++		inspection.configure(s)
++	}
++}
++func CurrentInspectionState() InspectionState {
++	if inspection == nil {
++		return InspectionState{Phase: "idle", Results: []InspectionResult{}}
++	}
++	return inspection.snapshot()
++}
++func StartInspection() error {
++	if inspection == nil {
++		return fmt.Errorf("巡检尚未初始化")
++	}
++	return inspection.start()
++}
++func CancelInspection() {
++	if inspection != nil {
++		inspection.stop()
++	}
++}
++
++func (i *inspector) signal() {
++	select {
++	case i.wake <- struct{}{}:
++	default:
++	}
++}
++func (i *inspector) loadInitialSettings() {
++	s, err := i.hooks.Load(i.ctx)
++	if err != nil {
++		i.mu.Lock()
++		i.state.Error = err.Error()
++		i.mu.Unlock()
++		return
++	}
++	if err := s.Validate(); err != nil {
++		i.mu.Lock()
++		i.state.Error = err.Error()
++		i.mu.Unlock()
++		return
++	}
++	i.configure(s)
++}
++func (i *inspector) configure(s InspectionSettings) {
++	i.mu.Lock()
++	reschedule := !i.settingsLoaded || s.Enabled != i.settings.Enabled || s.MinWaitMinutes != i.settings.MinWaitMinutes || s.MaxWaitMinutes != i.settings.MaxWaitMinutes
++	if !i.settingsLoaded {
++		i.state.Error = ""
++	}
++	i.settings = s
++	i.state.Enabled = s.Enabled
++	i.settingsLoaded = true
++	if reschedule {
++		i.scheduleLocked()
++	}
++	i.mu.Unlock()
++	i.signal()
++}
++
++func inspectionDelay(s InspectionSettings) time.Duration {
++	minDelay, maxDelay := time.Duration(s.MinWaitMinutes)*time.Minute, time.Duration(s.MaxWaitMinutes)*time.Minute
++	if maxDelay <= minDelay {
++		return minDelay
++	}
++	return minDelay + time.Duration(rand.Int64N(int64(maxDelay-minDelay)+1))
++}
++func (i *inspector) scheduleLocked() {
++	i.state.NextRunAt = nil
++	if i.settings.Enabled && !i.state.Running && i.ctx.Err() == nil {
++		next := time.Now().Add(inspectionDelay(i.settings))
++		i.state.NextRunAt = &next
++	}
++}
++
++func (i *inspector) loop() {
++	defer close(i.done)
++	for {
++		i.mu.Lock()
++		next := i.state.NextRunAt
++		i.mu.Unlock()
++		var timer *time.Timer
++		var tick <-chan time.Time
++		if next != nil {
++			timer = time.NewTimer(max(time.Until(*next), 0))
++			tick = timer.C
++		}
++		select {
++		case <-i.ctx.Done():
++			if timer != nil {
++				timer.Stop()
++			}
++			i.mu.Lock()
++			done := i.runDone
++			i.mu.Unlock()
++			if done != nil {
++				<-done
++			}
++			return
++		case <-i.wake:
++			if timer != nil {
++				timer.Stop()
++			}
++		case <-tick:
++			_ = i.startRun(true)
++		}
++	}
++}
++
++func (i *inspector) snapshot() InspectionState {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	s := i.state
++	s.Results = append([]InspectionResult{}, s.Results...)
++	for n := range s.Results {
++		s.Results[n].RunIDs = append([]string{}, s.Results[n].RunIDs...)
++	}
++	return s
++}
++
++func (i *inspector) start() error {
++	return i.startRun(false)
++}
++
++func inspectionTestType(s InspectionSettings) string {
++	if strings.TrimSpace(s.TestType) == "fingerprint" {
++		return "fingerprint"
++	}
++	return "candy"
++}
++
++func (i *inspector) startRun(automatic bool) error {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	if automatic && (!i.settings.Enabled || i.state.NextRunAt == nil || time.Until(*i.state.NextRunAt) > 0) {
++		return nil
++	}
++	if !i.settingsLoaded {
++		return fmt.Errorf("巡检设置尚未加载")
++	}
++	if i.ctx.Err() != nil {
++		return fmt.Errorf("应用正在停止")
++	}
++	if i.state.Running {
++		return fmt.Errorf("已有巡检正在执行")
++	}
++	if err := i.settings.Validate(); err != nil {
++		return err
++	}
++	if i.settings.GroupID == 0 {
++		return fmt.Errorf("请选择糖果测试分组")
++	}
++	ctx, cancel := context.WithCancel(i.ctx)
++	i.runCancel = cancel
++	i.runDone = make(chan struct{})
++	now := time.Now().UTC()
++	i.state = InspectionState{Enabled: i.settings.Enabled, Running: true, Phase: "testing", StartedAt: &now, Results: []InspectionResult{}}
++	go i.run(ctx, i.settings, i.runDone)
++	i.signal()
++	return nil
++}
++func (i *inspector) stop() {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	if i.runCancel != nil {
++		i.state.Cancelling = true
++		i.runCancel()
++	}
++}
++func (i *inspector) phase(phase string) { i.mu.Lock(); i.state.Phase = phase; i.mu.Unlock() }
++func (i *inspector) result(index int, update func(*InspectionResult)) {
++	i.mu.Lock()
++	defer i.mu.Unlock()
++	update(&i.state.Results[index])
++}
++
++func matchesInspectionAccountType(a InspectionAccount, filter string) bool {
++	filter = strings.TrimSpace(filter)
++	if filter == "" || filter == "all" {
++		return true
++	}
++	if platform, credType, ok := strings.Cut(filter, ":"); ok {
++		acctPlatform := strings.TrimSpace(a.Platform)
++		if acctPlatform == "" {
++			acctPlatform = "openai"
++		}
++		return strings.EqualFold(acctPlatform, platform) && strings.EqualFold(a.Type, credType)
++	}
++	return strings.EqualFold(a.Type, filter)
++}
++
++func matchesAnyInspectionPattern(a InspectionAccount, patterns []string) bool {
++	for _, raw := range patterns {
++		pattern := strings.TrimSpace(raw)
++		if pattern == "" {
++			continue
++		}
++		for _, value := range []string{a.Email, a.Name} {
++			if value == "" {
++				continue
++			}
++			if matched, err := path.Match(pattern, value); err == nil && matched {
++				return true
++			}
++		}
++	}
++	return false
++}
++
++func matchesInspectionPatterns(a InspectionAccount, include, exclude []string) bool {
++	hasInclude := false
++	for _, raw := range include {
++		if strings.TrimSpace(raw) != "" {
++			hasInclude = true
++			break
++		}
++	}
++	if hasInclude && !matchesAnyInspectionPattern(a, include) {
++		return false
++	}
++	if matchesAnyInspectionPattern(a, exclude) {
++		return false
++	}
++	return true
++}
++
++func inspectionEligible(a InspectionAccount, s InspectionSettings) bool {
++	if !a.AutoInspectionEnabled || !a.Available || s.EnabledOnly && !a.Enabled || !matchesInspectionAccountType(a, s.AccountType) {
++		return false
++	}
++	member := false
++	for _, id := range a.GroupIDs {
++		member = member || id == s.GroupID
++	}
++	if !member {
++		return false
++	}
++	if !matchesInspectionPatterns(a, s.IncludePatterns, s.ExcludePatterns) {
++		return false
++	}
++	if s.AccountPlan == "" || s.AccountPlan == "all" {
++		return true
++	}
++	if a.Type != "oauth" || (a.Platform != "" && a.Platform != "openai") {
++		return false
++	}
++	label, pro := candyPlan(a.PlanType)
++	return s.AccountPlan == label || s.AccountPlan == "Pro ALL" && pro
++}
++
++// Keep these labels aligned with CODEX_PLANS in web/components.js.
++func candyPlan(raw string) (string, bool) {
++	id := strings.TrimSpace(raw)
++	switch strings.ToLower(id) {
++	case "promax":
++		return "Pro 500", true
++	case "pro":
++		return "Pro 200", true
++	case "prolite", "pro-lite", "pro_lite":
++		return "Pro 100", true
++	case "plus":
++		return "Plus", false
++	case "go":
++		return "Go", false
++	case "self_serve_business_prolite":
++		return "Business Premium", false
++	case "team", "self_serve_business_usage_based":
++		return "Business", false
++	case "business", "enterprise", "ent26", "enterprise_cbp_usage_based", "hc":
++		return "Enterprise", false
++	case "enterprise_cbp_automation":
++		return "Enterprise (Automation)", false
++	case "edu_pro":
++		return "Edu Pro", false
++	case "edu_plus":
++		return "Edu Plus", false
++	case "edu", "education":
++		return "Edu", false
++	case "free":
++		return "Free", false
++	}
++	if id == "" {
++		id = "未知"
++	}
++	return id, false
++}
++
++func (i *inspector) run(ctx context.Context, s InspectionSettings, done chan struct{}) {
++	testType := inspectionTestType(s)
++	defer func() {
++		i.mu.Lock()
++		now := time.Now().UTC()
++		i.state.FinishedAt = &now
++		if ctx.Err() != nil {
++			i.state.Phase = "cancelled"
++			for n := range i.state.Results {
++				r := &i.state.Results[n]
++				if r.Outcome == "testing" || r.Outcome == "recommended" {
++					r.Outcome = "cancelled"
++					r.TargetPriority = nil
++				}
++			}
++		} else if i.state.Error != "" {
++			i.state.Phase = "failed"
++		} else {
++			i.state.Phase = "completed"
++		}
++		i.state.Running, i.state.Cancelling = false, false
++		i.runCancel = nil
++		i.scheduleLocked()
++		i.mu.Unlock()
++		close(done)
++		i.signal()
++	}()
++	accounts, err := i.hooks.List(ctx, s)
++	if err != nil {
++		i.mu.Lock()
++		i.state.Error = err.Error()
++		i.mu.Unlock()
++		return
++	}
++	eligible := []InspectionAccount{}
++	for _, a := range accounts {
++		if !inspectionEligible(a, s) {
++			continue
++		}
++		mu.Lock()
++		busy := active[strconv.FormatInt(a.AccountID, 10)] != nil
++		mu.Unlock()
++		if busy {
++			continue
++		}
++		a.GroupID = s.GroupID
++		eligible = append(eligible, a)
++	}
++	i.mu.Lock()
++	i.state.Total = len(eligible)
++	for _, a := range eligible {
++		i.state.Results = append(i.state.Results, InspectionResult{AccountID: a.AccountID, AccountName: a.Name, Priority: a.Priority, RunIDs: []string{}, Outcome: "testing"})
++	}
++	i.mu.Unlock()
++	groups := map[int][]InspectionAccount{s.DegradedPriority: {}, s.NormalPriority: {}}
++	indexes := map[int64]int{}
++	baselines := map[int64]int{}
++	for n, a := range eligible {
++		indexes[a.AccountID] = n
++	}
++	changed := map[int][]int{}
++	apply := func(a InspectionAccount, target int) {
++		n := indexes[a.AccountID]
++		if i.applyAccount(ctx, s, n, a, baselines[a.AccountID], target) {
++			changed[target] = append(changed[target], n)
++		}
++	}
++	first := i.testPhase(ctx, s, eligible, 1, false, func(a InspectionAccount, answers []bool) {
++		n := indexes[a.AccountID]
++		i.result(n, func(r *InspectionResult) { r.Outcome = "unchanged" })
++		current, err := i.hooks.Get(ctx, a.AccountID)
++		if err != nil {
++			i.result(n, func(r *InspectionResult) { r.Outcome = "error"; r.Error = err.Error() })
++			return
++		}
++		if !inspectionEligible(current, s) {
++			return
++		}
++		a.Priority = current.Priority
++		baselines[a.AccountID] = current.Priority
++		target := s.DegradedPriority
++		if answers[0] {
++			target = s.NormalPriority
++		}
++		if (current.Verdict == InspectionVerdictDegraded) == !answers[0] {
++			apply(a, target)
++			return
++		}
++		if testType == "fingerprint" {
++			i.result(n, func(r *InspectionResult) { p := target; r.TargetPriority = &p; r.Outcome = "recommended" })
++			apply(a, target)
++			return
++		}
++		groups[target] = append(groups[target], a)
++	})
++	if ctx.Err() != nil {
++		return
++	}
++	for _, target := range []int{s.DegradedPriority, s.NormalPriority} {
++		group := groups[target]
++		if len(group) == 0 {
++			continue
++		}
++		if target == s.NormalPriority && s.MaxTestsPerAccount > 1 {
++			i.phase("recovery_wait")
++			if !waitInspection(ctx, i.recovery) {
++				return
++			}
++		}
++		confirmed := func(a InspectionAccount, confirmation []bool) {
++			n := indexes[a.AccountID]
++			answers := append(append([]bool{}, first[a.AccountID]...), confirmation...)
++			if len(answers) != s.MaxTestsPerAccount {
++				return
++			}
++			expected := target == s.NormalPriority
++			consistent := true
++			for _, answer := range answers {
++				consistent = consistent && answer == expected
++			}
++			if !consistent {
++				i.result(n, func(r *InspectionResult) { r.Outcome = "unchanged" })
++				return
++			}
++			i.result(n, func(r *InspectionResult) { p := target; r.TargetPriority = &p; r.Outcome = "recommended" })
++			apply(a, target)
++		}
++		if s.MaxTestsPerAccount > 1 {
++			i.phase("testing")
++			i.testPhase(ctx, s, group, s.MaxTestsPerAccount-1, true, confirmed)
++		} else {
++			for _, a := range group {
++				confirmed(a, nil)
++			}
++		}
++	}
++	if ctx.Err() != nil {
++		return
++	}
++	testLabel := "糖果测试"
++	if testType == "fingerprint" {
++		testLabel = "指纹检测"
++	}
++	for _, target := range []int{s.NormalPriority, s.DegradedPriority} {
++		indexes := changed[target]
++		if !s.NotifyEnabled || i.hooks.Notify == nil || len(indexes) == 0 || ctx.Err() != nil {
++			continue
++		}
++		title := "账号确认降智"
++		verdict := "正常 → 降级"
++		if target == s.NormalPriority {
++			title = "账号恢复正常"
++			verdict = "降级 → 正常"
++		}
++		lines := []string{fmt.Sprintf("%s · %s\n确认状态：%s", testLabel, s.Model, verdict)}
++		snapshot := i.snapshot()
++		for _, n := range indexes {
++			r := snapshot.Results[n]
++			lines = append(lines, fmt.Sprintf("%s：%s", r.AccountName, verdict))
++		}
++		if err := i.hooks.Notify(ctx, s, "Sub2API 巡检："+title, strings.Join(lines, "\n")); err != nil {
++			for _, n := range indexes {
++				i.result(n, func(r *InspectionResult) { r.NotificationError = err.Error() })
++			}
++		}
++	}
++	i.mu.Lock()
++	i.state.Done = i.state.Total
++	i.mu.Unlock()
++}
++
++// applyAccount returns whether a verdict transition was saved, independently of priority writes.
++func (i *inspector) applyAccount(ctx context.Context, s InspectionSettings, n int, a InspectionAccount, baseline, target int) bool {
++	current, err := i.hooks.Get(ctx, a.AccountID)
++	if err == nil && !current.AutoInspectionEnabled {
++		i.result(n, func(r *InspectionResult) { r.Outcome = "unchanged"; r.TargetPriority = nil })
++		return false
++	}
++	if ctx.Err() != nil {
++		return false
++	}
++	changed := false
++	if err == nil {
++		verdict := InspectionVerdictDegraded
++		if target == s.NormalPriority {
++			verdict = InspectionVerdictNormal
++		}
++		changed = (current.Verdict == InspectionVerdictDegraded) != (verdict == InspectionVerdictDegraded)
++		err = i.hooks.PersistVerdict(ctx, a.AccountID, verdict, s)
++	}
++	if err != nil {
++		i.result(n, func(r *InspectionResult) { r.Outcome = "error"; r.Error = err.Error() })
++		return false
++	}
++	if !s.AdjustPriority {
++		return changed
++	}
++	if !inspectionEligible(current, s) || current.Priority != baseline {
++		err = fmt.Errorf("账户状态或优先级已改变")
++	}
++	mu.Lock()
++	busy := active[strconv.FormatInt(a.AccountID, 10)] != nil
++	mu.Unlock()
++	if err == nil && busy {
++		err = fmt.Errorf("账户正在测试")
++	}
++	if err == nil && current.Priority == target {
++		return changed
++	}
++	if err == nil && ctx.Err() == nil {
++		err = i.hooks.UpdatePriority(ctx, a.AccountID, target)
++	}
++	if ctx.Err() != nil {
++		return false
++	}
++	if err != nil {
++		i.result(n, func(r *InspectionResult) { r.Outcome = "error"; r.Error = err.Error() })
++		return changed
++	}
++	i.result(n, func(r *InspectionResult) { p := target; r.TargetPriority = &p; r.Outcome = "updated" })
++	return changed
++}
++
++func waitInspection(ctx context.Context, d time.Duration) bool {
++	timer := time.NewTimer(d)
++	defer timer.Stop()
++	select {
++	case <-ctx.Done():
++		return false
++	case <-timer.C:
++		return true
++	}
++}
++
++func (i *inspector) testPhase(ctx context.Context, s InspectionSettings, accounts []InspectionAccount, runs int, confirmation bool, completed func(InspectionAccount, []bool)) map[int64][]bool {
++	testType := inspectionTestType(s)
++	answers := map[int64][]bool{}
++	accumulated := map[int64][]bool{}
++	failed := map[int64]bool{}
++	index := map[int64]int{}
++	byID := map[int64]InspectionAccount{}
++	i.mu.Lock()
++	for n, r := range i.state.Results {
++		index[r.AccountID] = n
++	}
++	i.mu.Unlock()
++	for _, a := range accounts {
++		byID[a.AccountID] = a
++	}
++	batches := 1
++	phaseCtx, cancel := context.WithTimeout(ctx, i.phaseLimit)
++	defer cancel()
++	currentAccounts := append([]InspectionAccount(nil), accounts...)
++	for step := 0; step < batches && len(currentAccounts) > 0; step++ {
++		if ctx.Err() != nil {
++			break
++		}
++		tracked := map[int64]string{}
++		for _, a := range currentAccounts {
++			if ctx.Err() != nil {
++				break
++			}
++			check := func(checkCtx context.Context, id int64) error {
++				current, err := i.hooks.Get(checkCtx, id)
++				if err == nil && !current.AutoInspectionEnabled {
++					i.result(index[id], func(r *InspectionResult) { r.Outcome = "unchanged"; r.TargetPriority = nil })
++					return errInspectionStopped
++				}
++				if err == nil && (!inspectionEligible(current, s) || confirmation && current.Priority != a.Priority) {
++					err = fmt.Errorf("账户状态或优先级已改变")
++				}
++				if err != nil {
++					i.result(index[id], func(r *InspectionResult) { r.Outcome = "error"; r.Error = err.Error() })
++				}
++				return err
++			}
++			i.result(index[a.AccountID], func(r *InspectionResult) { r.Outcome = "testing" })
++			var req StartRequest
++			if testType == "fingerprint" {
++				req = StartRequest{Type: "fingerprint", Targets: []Target{a.Target}, Model: s.Model, Concurrency: 1}
++			} else {
++				req = StartRequest{Type: "candy", Targets: []Target{a.Target}, Model: s.Model, Effort: s.Effort, Runs: runs}
++			}
++			summary, err := start(ctx, req, true, check)
++			if err == nil && len(summary.Started) != 1 {
++				err = fmt.Errorf("账户忙碌或不可测试")
++				if len(summary.Unavailable) > 0 {
++					err = fmt.Errorf("%s", summary.Unavailable[0].Error)
++				}
++			}
++			if err != nil {
++				failed[a.AccountID] = true
++				i.result(index[a.AccountID], func(r *InspectionResult) { r.Outcome = "error"; r.Error = err.Error() })
++				continue
++			}
++			id := summary.Started[0].ID
++			tracked[a.AccountID] = id
++			i.result(index[a.AccountID], func(r *InspectionResult) { r.RunIDs = append(r.RunIDs, id) })
++		}
++		collect := func(id int64, runID string) {
++			if testType == "fingerprint" {
++				mu.Lock()
++				results := []fingerprintResult{}
++				for _, r := range fingerprintResults[strconv.FormatInt(id, 10)] {
++					if r.RunID == runID {
++						results = append(results, r)
++					}
++				}
++				mu.Unlock()
++				valid := len(results) == 1 && results[0].Attribution != nil && (results[0].Status == "completed" || results[0].Status == "partial") && results[0].Error == ""
++				errorText := "指纹归因结果不完整"
++				if len(results) > 0 && results[0].Error != "" {
++					errorText = results[0].Error
++				}
++				if valid {
++					ok := FingerprintModelID(results[0].Model) == FingerprintModelID(results[0].Attribution.Prediction)
++					accumulated[id] = append(accumulated[id], ok)
++				} else {
++					failed[id] = true
++				}
++				i.result(index[id], func(r *InspectionResult) {
++					r.Tests += len(results)
++					if !valid && r.Outcome == "testing" {
++						r.Outcome = "error"
++						r.Error = errorText
++					}
++				})
++				if !failed[id] && len(accumulated[id]) == runs && ctx.Err() == nil {
++					out := append([]bool(nil), accumulated[id]...)
++					answers[id] = out
++					completed(byID[id], out)
++				}
++				return
++			}
++			mu.Lock()
++			results := []candyResult{}
++			for _, r := range candyResults[strconv.FormatInt(id, 10)] {
++				if r.RunID == runID {
++					results = append(results, r)
++				}
++			}
++			mu.Unlock()
++			valid := len(results) == runs
++			out := []bool{}
++			errorText := "测试结果不完整"
++			for _, r := range results {
++				valid = valid && r.Status == "completed" && r.Error == "" && !r.Skipped
++				if r.Error != "" {
++					errorText = r.Error
++				}
++				out = append(out, r.OK)
++			}
++			i.result(index[id], func(r *InspectionResult) {
++				r.Tests += len(results)
++				if !valid && r.Outcome == "testing" {
++					r.Outcome = "error"
++					r.Error = errorText
++				}
++			})
++			if valid && ctx.Err() == nil {
++				answers[id] = out
++				completed(byID[id], out)
++			} else {
++				failed[id] = true
++			}
++		}
++		for len(tracked) > 0 {
++			finished := map[int64]string{}
++			mu.Lock()
++			for id, runID := range tracked {
++				if r := active[strconv.FormatInt(id, 10)]; r == nil || r.ID != runID {
++					finished[id] = runID
++				}
++			}
++			mu.Unlock()
++			if step == batches-1 {
++				i.mu.Lock()
++				i.state.Done = i.state.Total - len(tracked) + len(finished)
++				i.mu.Unlock()
++			}
++			for id, runID := range finished {
++				collect(id, runID)
++				delete(tracked, id)
++			}
++			if len(tracked) == 0 {
++				break
++			}
++			if !waitInspection(phaseCtx, i.poll) {
++				for _, id := range tracked {
++					Cancel(id)
++				}
++				// Keep the round busy until its actual workers exit.
++				for busy := true; busy; {
++					busy = false
++					mu.Lock()
++					for id, runID := range tracked {
++						if r := active[strconv.FormatInt(id, 10)]; r != nil && r.ID == runID {
++							busy = true
++						}
++					}
++					mu.Unlock()
++					if busy {
++						time.Sleep(time.Millisecond * 10)
++					}
++				}
++				for id := range tracked {
++					i.result(index[id], func(r *InspectionResult) { r.Outcome = "error"; r.Error = phaseCtx.Err().Error() })
++				}
++				return answers
++			}
++		}
++		if step+1 < batches {
++			nextAccounts := make([]InspectionAccount, 0, len(currentAccounts))
++			for _, a := range currentAccounts {
++				if failed[a.AccountID] {
++					continue
++				}
++				i.mu.Lock()
++				testing := i.state.Results[index[a.AccountID]].Outcome == "testing"
++				i.mu.Unlock()
++				if testing {
++					nextAccounts = append(nextAccounts, a)
++				}
++			}
++			currentAccounts = nextAccounts
++		}
++	}
++	return answers
++}
+diff --git a/backend/internal/codexeval/inspection_notify.go b/backend/internal/codexeval/inspection_notify.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..8429d5930514979f52f89abd0107965386096380
+--- /dev/null
++++ b/backend/internal/codexeval/inspection_notify.go
+@@ -0,0 +1,50 @@
++package codexeval
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net/http"
++	"net/url"
++	"strings"
++	"time"
++)
++
++func SendInspectionNotification(ctx context.Context, s InspectionSettings, title, message string) error {
++	client := &http.Client{Timeout: 30 * time.Second}
++	send := func(channel, endpoint, contentType, body string, auth bool) error {
++		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body))
++		if err != nil {
++			return fmt.Errorf("%s: invalid notification address", channel)
++		}
++		if contentType != "" {
++			req.Header.Set("Content-Type", contentType)
++		}
++		if auth && s.NtfyPassword != "" {
++			req.SetBasicAuth(s.NtfyUsername, s.NtfyPassword)
++		}
++		resp, err := client.Do(req)
++		if err != nil {
++			return fmt.Errorf("%s: notification request failed", channel)
++		}
++		defer resp.Body.Close()
++		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++			return fmt.Errorf("%s: HTTP %d", channel, resp.StatusCode)
++		}
++		return nil
++	}
++	var failures []error
++	if s.NtfyServer != "" && s.NtfyTopic != "" {
++		endpoint := strings.TrimRight(s.NtfyServer, "/") + "/" + url.PathEscape(s.NtfyTopic) + "?" + url.Values{"title": {title}}.Encode()
++		if err := send("ntfy", endpoint, "text/plain; charset=utf-8", message, true); err != nil {
++			failures = append(failures, err)
++		}
++	}
++	if s.BarkURL != "" {
++		body := url.Values{"title": {title}, "body": {message}}.Encode()
++		if err := send("Bark", s.BarkURL, "application/x-www-form-urlencoded", body, false); err != nil {
++			failures = append(failures, err)
++		}
++	}
++	return errors.Join(failures...)
++}
+diff --git a/backend/internal/codexeval/inspection_settings.go b/backend/internal/codexeval/inspection_settings.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa06f6a5bda91ad83481d1eedcde67226abcfd0b
+--- /dev/null
++++ b/backend/internal/codexeval/inspection_settings.go
+@@ -0,0 +1,180 @@
++package codexeval
++
++import (
++	"fmt"
++	"net/url"
++	"path"
++	"strings"
++	"time"
++)
++
++type InspectionSettings struct {
++	Enabled                bool     `json:"enabled"`
++	GroupID                int64    `json:"group_id"`
++	AccountType            string   `json:"account_type"`
++	AccountPlan            string   `json:"account_plan"`
++	EnabledOnly            bool     `json:"enabled_only"`
++	Model                  string   `json:"model"`
++	Effort                 string   `json:"effort"`
++	TestType               string   `json:"test_type"`
++	MaxTestsPerAccount     int      `json:"max_tests_per_account"`
++	MinWaitMinutes         int      `json:"min_wait_minutes"`
++	MaxWaitMinutes         int      `json:"max_wait_minutes"`
++	IncludePatterns        []string `json:"include_patterns"`
++	ExcludePatterns        []string `json:"exclude_patterns"`
++	AdjustPriority         bool     `json:"adjust_priority"`
++	ControlModels          bool     `json:"control_models"`
++	NotifyEnabled          bool     `json:"notify_enabled"`
++	DegradedRemoveModels   []string `json:"degraded_remove_models"`
++	NormalPriority         int      `json:"normal_priority"`
++	DegradedPriority       int      `json:"degraded_priority"`
++	NtfyServer             string   `json:"ntfy_server"`
++	NtfyTopic              string   `json:"ntfy_topic"`
++	NtfyUsername           string   `json:"ntfy_username"`
++	NtfyPassword           string   `json:"ntfy_password"`
++	BarkURL                string   `json:"bark_url"`
++	NtfyPasswordConfigured bool     `json:"ntfy_password_configured"`
++	BarkURLConfigured      bool     `json:"bark_url_configured"`
++}
++
++func DefaultInspectionSettings() InspectionSettings {
++	return InspectionSettings{Model: "gpt-6.1-sol", Effort: "low", TestType: "candy", MaxTestsPerAccount: 3, MinWaitMinutes: 15, MaxWaitMinutes: 35,
++		AccountType: "all", AccountPlan: "all", NormalPriority: 10, DegradedPriority: 99, NotifyEnabled: true, NtfyServer: "https://ntfy.sh",
++		IncludePatterns: []string{}, ExcludePatterns: []string{},
++		DegradedRemoveModels: []string{"gpt-6.1-sol", "gpt-6-sol", "gpt-5.6-sol", "gpt-6-astra", "gpt-6.1-terra", "gpt-6.2-sol"}}
++}
++
++func normalizePatternSlice(patterns []string) []string {
++	if len(patterns) == 0 {
++		return []string{}
++	}
++	out := make([]string, 0, len(patterns))
++	seen := make(map[string]bool, len(patterns))
++	for _, pattern := range patterns {
++		pattern = strings.TrimSpace(pattern)
++		if pattern == "" || seen[pattern] {
++			continue
++		}
++		seen[pattern] = true
++		out = append(out, pattern)
++	}
++	return out
++}
++
++func validInspectionAccountType(accountType string) bool {
++	switch accountType {
++	case "all", "oauth", "apikey", "setup-token", "upstream":
++		return true
++	}
++	platform, credType, ok := strings.Cut(accountType, ":")
++	if !ok || platform == "" {
++		return false
++	}
++	for _, r := range platform {
++		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
++			return false
++		}
++	}
++	switch credType {
++	case "oauth", "setup-token", "apikey", "upstream":
++		return true
++	default:
++		return false
++	}
++}
++
++func (s *InspectionSettings) NormalizeModels() {
++	if strings.TrimSpace(s.TestType) == "" {
++		s.TestType = "candy"
++	} else {
++		s.TestType = strings.TrimSpace(s.TestType)
++	}
++	s.IncludePatterns = normalizePatternSlice(s.IncludePatterns)
++	s.ExcludePatterns = normalizePatternSlice(s.ExcludePatterns)
++	if s.DegradedRemoveModels == nil {
++		s.DegradedRemoveModels = DefaultInspectionSettings().DegradedRemoveModels
++	}
++	models := make([]string, 0, len(s.DegradedRemoveModels))
++	seen := make(map[string]bool)
++	for _, model := range s.DegradedRemoveModels {
++		model = strings.TrimSpace(model)
++		if !seen[model] {
++			models = append(models, model)
++			seen[model] = true
++		}
++	}
++	s.DegradedRemoveModels = models
++}
++
++func ValidInspectionRemovalModel(model string) bool {
++	return validModelName(model, true) && !strings.ContainsAny(model, "*?") && model != "blacklist"
++}
++
++func (s InspectionSettings) Public() InspectionSettings {
++	s.NtfyPasswordConfigured = s.NtfyPassword != ""
++	s.BarkURLConfigured = s.BarkURL != ""
++	s.NtfyPassword, s.BarkURL = "", ""
++	return s
++}
++
++func (s InspectionSettings) Validate() error {
++	for _, model := range s.DegradedRemoveModels {
++		if !ValidInspectionRemovalModel(strings.TrimSpace(model)) {
++			return fmt.Errorf("请输入有效的降级移除模型")
++		}
++	}
++	if s.GroupID < 0 || s.Enabled && s.GroupID == 0 {
++		return fmt.Errorf("请选择糖果测试分组")
++	}
++	if !validInspectionAccountType(s.AccountType) {
++		return fmt.Errorf("请选择有效账户类型")
++	}
++	if strings.TrimSpace(s.AccountPlan) == "" {
++		return fmt.Errorf("请选择有效订阅类型")
++	}
++	testType := strings.TrimSpace(s.TestType)
++	if testType == "" {
++		testType = "candy"
++	}
++	if testType != "candy" && testType != "fingerprint" {
++		return fmt.Errorf("请选择有效检查方式")
++	}
++	if !validModelName(strings.TrimSpace(s.Model), testType != "fingerprint") {
++		return fmt.Errorf("请输入有效模型")
++	}
++	for _, pattern := range append(append([]string(nil), s.IncludePatterns...), s.ExcludePatterns...) {
++		pattern = strings.TrimSpace(pattern)
++		if pattern == "" {
++			continue
++		}
++		if _, err := path.Match(pattern, ""); err != nil {
++			return fmt.Errorf("请输入有效的账户匹配通配符")
++		}
++	}
++	if s.MaxTestsPerAccount < 1 || s.MaxTestsPerAccount > candyMaxRuns {
++		return fmt.Errorf("每账户最多测试次数须为 1–%d", candyMaxRuns)
++	}
++	if s.MinWaitMinutes < 1 || s.MaxWaitMinutes < s.MinWaitMinutes {
++		return fmt.Errorf("最长等待时间须不小于最短等待时间，且至少为 1 分钟")
++	}
++	// Duration conversion must remain representable.
++	if int64(s.MaxWaitMinutes) > (1<<63-1)/int64(time.Minute) {
++		return fmt.Errorf("等待时间过长")
++	}
++	if s.NormalPriority < 1 {
++		return fmt.Errorf("正常优先级须至少为 1")
++	}
++	if s.NormalPriority >= s.DegradedPriority {
++		return fmt.Errorf("正常优先级须小于降级优先级")
++	}
++	for _, raw := range []string{s.NtfyServer, s.BarkURL} {
++		if raw == "" {
++			continue
++		}
++		u, err := url.Parse(raw)
++		if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
++			return fmt.Errorf("请输入有效的 HTTP 或 HTTPS 通知地址")
++		}
++	}
++	return nil
++}
+diff --git a/backend/internal/handler/admin/codex_inspection_handler.go b/backend/internal/handler/admin/codex_inspection_handler.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d42a935d2769c15122c5a451d7ef2e578f2e0e85
+--- /dev/null
++++ b/backend/internal/handler/admin/codex_inspection_handler.go
+@@ -0,0 +1,177 @@
++package admin
++
++import (
++	"context"
++	"net/http"
++	"strconv"
++	"strings"
++
++	"github.com/Wei-Shaw/sub2api/internal/codexeval"
++	"github.com/Wei-Shaw/sub2api/internal/pkg/response"
++	"github.com/Wei-Shaw/sub2api/internal/service"
++	"github.com/gin-gonic/gin"
++)
++
++func isInspectionSupportedAccount(a *service.Account) bool {
++	if a == nil {
++		return false
++	}
++	return a.IsOAuth() || a.Type == service.AccountTypeAPIKey || a.Type == service.AccountTypeUpstream
++}
++
++func extractAccountEmail(a *service.Account) string {
++	if a == nil {
++		return ""
++	}
++	for _, key := range []string{"email", "email_address"} {
++		if a.Extra != nil {
++			if v, ok := a.Extra[key].(string); ok && strings.TrimSpace(v) != "" {
++				return strings.TrimSpace(v)
++			}
++		}
++		if v := strings.TrimSpace(a.GetCredential(key)); v != "" {
++			return v
++		}
++	}
++	return ""
++}
++
++func inspectionAccount(a *service.Account) codexeval.InspectionAccount {
++	enabled, exists := a.Extra["codex_eval_inspection_enabled"].(bool)
++	if !exists {
++		enabled = true
++	}
++	verdict := codexeval.InspectionVerdictNormal
++	if a.Extra["codex_eval_inspection_verdict"] == string(codexeval.InspectionVerdictDegraded) {
++		verdict = codexeval.InspectionVerdictDegraded
++	}
++	return codexeval.InspectionAccount{Target: codexeval.Target{AccountID: a.ID}, Name: a.Name,
++		Email: extractAccountEmail(a), Platform: a.Platform,
++		Priority: a.Priority, Verdict: verdict, Available: a.IsSchedulable(), GroupIDs: a.GroupIDs, Type: a.Type,
++		PlanType: a.GetCredential("plan_type"), Enabled: a.Schedulable, AutoInspectionEnabled: enabled}
++}
++
++func (h *AccountHandler) UpdateCodexInspectionAccount(c *gin.Context) {
++	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
++	if err != nil || id <= 0 {
++		response.BadRequest(c, "Invalid account ID")
++		return
++	}
++	var req struct {
++		Enabled *bool `json:"enabled" binding:"required"`
++	}
++	if err := c.ShouldBindJSON(&req); err != nil {
++		response.BadRequest(c, err.Error())
++		return
++	}
++	a, err := h.adminService.GetAccount(c.Request.Context(), id)
++	if err != nil {
++		response.ErrorFrom(c, err)
++		return
++	}
++	if !isInspectionSupportedAccount(a) {
++		response.BadRequest(c, "Account does not support Codex evaluation inspection")
++		return
++	}
++	if err := h.adminService.UpdateAccountExtra(c.Request.Context(), id, map[string]any{"codex_eval_inspection_enabled": *req.Enabled}); err != nil {
++		response.ErrorFrom(c, err)
++		return
++	}
++	response.Success(c, gin.H{"account_id": id, "enabled": *req.Enabled})
++}
++
++func (h *AccountHandler) inspectionAccounts(ctx context.Context, items []service.Account) []codexeval.InspectionAccount {
++	rows := make([]AccountWithConcurrency, len(items))
++	for n := range items {
++		rows[n].Account = h.accountListResponseFromService(&items[n])
++	}
++	h.enrichShadowParents(ctx, rows)
++	out := make([]codexeval.InspectionAccount, len(items))
++	for n := range items {
++		out[n] = inspectionAccount(&items[n])
++		if out[n].PlanType == "" {
++			out[n].PlanType = rows[n].ParentPlanType
++		}
++	}
++	return out
++}
++
++func (h *SettingHandler) InitializeCodexInspection(accounts *AccountHandler) {
++	codexeval.InitializeInspection(codexeval.InspectionHooks{
++		Load: h.settingService.GetCodexInspectionSettings,
++		List: func(ctx context.Context, settings codexeval.InspectionSettings) ([]codexeval.InspectionAccount, error) {
++			out := []codexeval.InspectionAccount{}
++			for page := 1; ; page++ {
++				items, total, err := accounts.adminService.ListAccounts(ctx, page, 100, "", "", "", "", settings.GroupID, "", "id", "asc")
++				if err != nil {
++					return nil, err
++				}
++				resolved := accounts.inspectionAccounts(ctx, items)
++				for n := range items {
++					a := &items[n]
++					if isInspectionSupportedAccount(a) {
++						out = append(out, resolved[n])
++					}
++				}
++				if page*100 >= int(total) || len(items) == 0 {
++					break
++				}
++			}
++			return out, nil
++		},
++		Get: func(ctx context.Context, id int64) (codexeval.InspectionAccount, error) {
++			a, err := accounts.adminService.GetAccount(ctx, id)
++			if err != nil {
++				return codexeval.InspectionAccount{}, err
++			}
++			return accounts.inspectionAccounts(ctx, []service.Account{*a})[0], nil
++		},
++		PersistVerdict: accounts.accountTestService.PersistCodexInspectionVerdict,
++		UpdatePriority: func(ctx context.Context, id int64, priority int) error {
++			_, err := accounts.adminService.UpdateAccount(ctx, id, &service.UpdateAccountInput{Priority: &priority})
++			return err
++		},
++		Notify: codexeval.SendInspectionNotification,
++	})
++}
++
++func (h *SettingHandler) GetCodexInspectionSettings(c *gin.Context) {
++	s, err := h.settingService.GetCodexInspectionSettings(c.Request.Context())
++	if err != nil {
++		response.Error(c, http.StatusInternalServerError, err.Error())
++		return
++	}
++	response.Success(c, s.Public())
++}
++func (h *SettingHandler) UpdateCodexInspectionSettings(c *gin.Context) {
++	var req codexeval.InspectionSettings
++	if err := c.ShouldBindJSON(&req); err != nil {
++		response.BadRequest(c, err.Error())
++		return
++	}
++	req.NormalizeModels()
++	if err := req.Validate(); err != nil {
++		response.BadRequest(c, err.Error())
++		return
++	}
++	s, err := h.settingService.UpdateCodexInspectionSettings(c.Request.Context(), req)
++	if err != nil {
++		response.Error(c, http.StatusInternalServerError, err.Error())
++		return
++	}
++	response.Success(c, s.Public())
++}
++func (h *AccountHandler) CodexInspectionState(c *gin.Context) {
++	response.Success(c, codexeval.CurrentInspectionState())
++}
++func (h *AccountHandler) CodexInspectionStart(c *gin.Context) {
++	if err := codexeval.StartInspection(); err != nil {
++		response.Error(c, http.StatusConflict, err.Error())
++		return
++	}
++	response.Success(c, codexeval.CurrentInspectionState())
++}
++func (h *AccountHandler) CodexInspectionStop(c *gin.Context) {
++	codexeval.CancelInspection()
++	response.Success(c, codexeval.CurrentInspectionState())
++}
+diff --git a/backend/internal/repository/account_codex_inspection.go b/backend/internal/repository/account_codex_inspection.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..789531d12fe0c37632efafd98f79aa64bc5cf6fc
+--- /dev/null
++++ b/backend/internal/repository/account_codex_inspection.go
+@@ -0,0 +1,81 @@
++package repository
++
++import (
++	"context"
++	"encoding/json"
++
++	dbent "github.com/Wei-Shaw/sub2api/ent"
++	"github.com/Wei-Shaw/sub2api/internal/service"
++)
++
++func (r *accountRepository) UpdateCodexInspectionState(ctx context.Context, expected *service.Account, mapping, extra map[string]any) (bool, error) {
++	if expected == nil {
++		return false, service.ErrAccountNilInput
++	}
++	if scoped := r.accountTransactionScope(ctx); scoped != r {
++		return scoped.UpdateCodexInspectionState(ctx, expected, mapping, extra)
++	}
++	if dbent.TxFromContext(ctx) != nil {
++		return r.updateCodexInspectionStateInTx(ctx, clientFromContext(ctx, r.client), expected, mapping, extra)
++	}
++	tx, err := r.client.Tx(ctx)
++	if err != nil {
++		return false, err
++	}
++	defer func() { _ = tx.Rollback() }()
++	applied, err := r.updateCodexInspectionStateInTx(dbent.NewTxContext(ctx, tx), tx.Client(), expected, mapping, extra)
++	if err != nil || !applied {
++		return false, err
++	}
++	if err = tx.Commit(); err != nil {
++		return false, err
++	}
++	r.syncSchedulerAccountSnapshotDetached(ctx, expected.ID)
++	return true, nil
++}
++
++func (r *accountRepository) updateCodexInspectionStateInTx(ctx context.Context, client *dbent.Client, expected *service.Account, mapping, extra map[string]any) (bool, error) {
++	credentials, err := json.Marshal(normalizeJSONMap(expected.Credentials))
++	if err != nil {
++		return false, err
++	}
++	updates := map[string]any{}
++	for _, key := range []string{"codex_eval_inspection_removed_models", "codex_eval_inspection_verdict"} {
++		if value, ok := extra[key]; ok {
++			updates[key] = value
++		}
++	}
++	payload, err := json.Marshal(updates)
++	if err != nil {
++		return false, err
++	}
++	var proxyID any
++	if expected.ProxyID != nil {
++		proxyID = *expected.ProxyID
++	}
++	args := []any{string(payload), expected.ID, expected.Platform, expected.Type, string(credentials), proxyID}
++	credentialsSet := ""
++	if mapping != nil {
++		mappingJSON, err := json.Marshal(mapping)
++		if err != nil {
++			return false, err
++		}
++		credentialsSet = ", credentials = jsonb_set(COALESCE(credentials, '{}'::jsonb), '{model_mapping}', $7::jsonb)"
++		args = append(args, string(mappingJSON))
++	}
++	result, err := client.ExecContext(ctx, `UPDATE accounts SET extra = COALESCE(extra, '{}'::jsonb) || $1::jsonb`+credentialsSet+`, updated_at = NOW()
++		WHERE id = $2 AND deleted_at IS NULL AND platform = $3 AND type = $4
++		AND COALESCE(credentials, '{}'::jsonb) = $5::jsonb AND proxy_id IS NOT DISTINCT FROM $6
++		AND COALESCE(extra -> 'codex_eval_inspection_enabled', 'true'::jsonb) <> 'false'::jsonb`, args...)
++	if err != nil {
++		return false, err
++	}
++	affected, err := result.RowsAffected()
++	if err != nil || affected == 0 {
++		return false, err
++	}
++	if err := enqueueSchedulerOutbox(ctx, client, service.SchedulerOutboxEventAccountChanged, &expected.ID, nil, nil); err != nil {
++		return false, err
++	}
++	return true, nil
++}
+diff --git a/backend/internal/service/codex_inspection_models.go b/backend/internal/service/codex_inspection_models.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..52d4398078ef8d70d2f1794d9c334a3db9ae1ed3
+--- /dev/null
++++ b/backend/internal/service/codex_inspection_models.go
+@@ -0,0 +1,112 @@
++package service
++
++import (
++	"context"
++	"errors"
++	"maps"
++
++	"github.com/Wei-Shaw/sub2api/internal/codexeval"
++)
++
++const codexInspectionRemovedModels = "codex_eval_inspection_removed_models"
++const codexInspectionVerdict = "codex_eval_inspection_verdict"
++
++type codexInspectionStateWriter interface {
++	UpdateCodexInspectionState(context.Context, *Account, map[string]any, map[string]any) (bool, error)
++}
++
++var errCodexInspectionAccountChanged = errors.New("account changed before inspection state was saved")
++
++func (s *AccountTestService) PersistCodexInspectionVerdict(ctx context.Context, id int64, verdict codexeval.InspectionVerdict, settings codexeval.InspectionSettings) error {
++	account, err := s.accountRepo.GetByID(ctx, id)
++	if err != nil {
++		return err
++	}
++	if enabled, ok := account.Extra["codex_eval_inspection_enabled"].(bool); ok && !enabled {
++		return errCodexInspectionAccountChanged
++	}
++	mapping, _ := account.Credentials["model_mapping"].(map[string]any)
++	mapping = maps.Clone(mapping)
++	removed := []string{}
++	seen := map[string]bool{}
++	switch saved := account.Extra[codexInspectionRemovedModels].(type) {
++	case []string:
++		removed = append(removed, saved...)
++	case []any:
++		for _, value := range saved {
++			if name, ok := value.(string); ok {
++				removed = append(removed, name)
++			}
++		}
++	}
++	changed := false
++	unique := make([]string, 0, len(removed))
++	for _, name := range removed {
++		if !seen[name] {
++			unique = append(unique, name)
++			seen[name] = true
++		}
++	}
++	removed = unique
++	switch verdict {
++	case codexeval.InspectionVerdictDegraded:
++		if settings.ControlModels && !account.IsOpenAIPassthroughEnabled() {
++			for _, name := range settings.DegradedRemoveModels {
++				if target, ok := mapping[name].(string); ok && target == name {
++					delete(mapping, name)
++					if !seen[name] {
++						removed = append(removed, name)
++						seen[name] = true
++					}
++					changed = true
++				}
++			}
++			if changed && len(mapping) == 0 {
++				mapping["blacklist"] = "blacklist"
++			}
++		}
++	case codexeval.InspectionVerdictNormal:
++		if len(removed) > 0 {
++			if mapping == nil {
++				mapping = make(map[string]any)
++			}
++			for _, name := range removed {
++				if _, exists := mapping[name]; !exists {
++					mapping[name] = name
++				}
++			}
++			if mapping["blacklist"] == "blacklist" {
++				delete(mapping, "blacklist")
++			}
++			removed = []string{}
++			changed = true
++		}
++	}
++	if !changed {
++		current := codexeval.InspectionVerdictNormal
++		if account.Extra[codexInspectionVerdict] == string(codexeval.InspectionVerdictDegraded) {
++			current = codexeval.InspectionVerdictDegraded
++		}
++		if current == verdict {
++			return nil
++		}
++	}
++	extra := map[string]any{codexInspectionVerdict: string(verdict)}
++	if changed {
++		extra[codexInspectionRemovedModels] = removed
++	} else {
++		mapping = nil
++	}
++	writer, ok := s.accountRepo.(codexInspectionStateWriter)
++	if !ok {
++		return errors.New("atomic inspection state writer is unavailable")
++	}
++	applied, err := writer.UpdateCodexInspectionState(ctx, account, mapping, extra)
++	if err != nil {
++		return err
++	}
++	if !applied {
++		return errCodexInspectionAccountChanged
++	}
++	return nil
++}
+diff --git a/backend/internal/service/codex_inspection_settings.go b/backend/internal/service/codex_inspection_settings.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..bf476823b5537886354aa6a52a1a24ee54e5a5a5
+--- /dev/null
++++ b/backend/internal/service/codex_inspection_settings.go
+@@ -0,0 +1,79 @@
++package service
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++
++	"github.com/Wei-Shaw/sub2api/internal/codexeval"
++)
++
++const codexInspectionSettingPrefix = "codex_eval_inspection_"
++
++func inspectionSettingValues(s codexeval.InspectionSettings) map[string]json.RawMessage {
++	raw, _ := json.Marshal(s)
++	values := map[string]json.RawMessage{}
++	_ = json.Unmarshal(raw, &values)
++	delete(values, "ntfy_password_configured")
++	delete(values, "bark_url_configured")
++	return values
++}
++
++func (s *SettingService) GetCodexInspectionSettings(ctx context.Context) (codexeval.InspectionSettings, error) {
++	out := codexeval.DefaultInspectionSettings()
++	fields := inspectionSettingValues(out)
++	keys := make([]string, 0, len(fields))
++	for field := range fields {
++		keys = append(keys, codexInspectionSettingPrefix+field)
++	}
++	stored, err := s.settingRepo.GetMultiple(ctx, keys)
++	if err != nil {
++		return out, err
++	}
++	for field := range fields {
++		if value, ok := stored[codexInspectionSettingPrefix+field]; ok {
++			if (field == "include_patterns" || field == "exclude_patterns" || field == "test_type") && !json.Valid([]byte(value)) {
++				continue
++			}
++			fields[field] = json.RawMessage(value)
++		}
++	}
++	raw, err := json.Marshal(fields)
++	if err != nil {
++		return out, fmt.Errorf("Read inspection settings: %w", err)
++	}
++	if err = json.Unmarshal(raw, &out); err != nil {
++		return out, fmt.Errorf("Read inspection settings: %w", err)
++	}
++	if out.NormalPriority < 1 {
++		out.NormalPriority = codexeval.DefaultInspectionSettings().NormalPriority
++	}
++	out.NormalizeModels()
++	return out, nil
++}
++
++func (s *SettingService) UpdateCodexInspectionSettings(ctx context.Context, next codexeval.InspectionSettings) (codexeval.InspectionSettings, error) {
++	next.NormalizeModels()
++	current, err := s.GetCodexInspectionSettings(ctx)
++	if err != nil {
++		return current, err
++	}
++	if next.NtfyPassword == "" {
++		next.NtfyPassword = current.NtfyPassword
++	}
++	if next.BarkURL == "" {
++		next.BarkURL = current.BarkURL
++	}
++	if err = next.Validate(); err != nil {
++		return current, err
++	}
++	values := map[string]string{}
++	for field, value := range inspectionSettingValues(next) {
++		values[codexInspectionSettingPrefix+field] = string(value)
++	}
++	if err = s.settingRepo.SetMultiple(ctx, values); err != nil {
++		return current, err
++	}
++	codexeval.UpdateInspectionSettings(next)
++	return next, nil
++}

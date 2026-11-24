@@ -1,0 +1,178 @@
+name: Build and Release
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Build {0} · {1}', inputs.upstream_tag, github.ref_name) || github.event.pull_request.title }}
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Upstream Sub2API version tag
+        required: true
+        default: v0.2.24
+        type: string
+      linux_amd64:
+        description: Build Linux x86_64
+        type: boolean
+        default: true
+      linux_arm64:
+        description: Build Linux ARM64
+        type: boolean
+        default: true
+      darwin_amd64:
+        description: Build macOS Intel
+        type: boolean
+        default: true
+      darwin_arm64:
+        description: Build macOS Apple Silicon
+        type: boolean
+        default: true
+      windows_amd64:
+        description: Build Windows x86_64
+        type: boolean
+        default: true
+      release:
+        description: Publish a GitHub Release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  SUB2API_BUILD_WORKSPACE: ${{ github.workspace }}/dist/work
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+  COREPACK_ENABLE_AUTO_PIN: "0"
+  COREPACK_ENABLE_PROJECT_SPEC: "0"
+
+jobs:
+  build-release:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GOMODCACHE: ${{ github.workspace }}/dist/cache/go-mod
+      GOCACHE: ${{ github.workspace }}/dist/cache/go-build
+      pnpm_config_store_dir: ${{ github.workspace }}/dist/cache/pnpm
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: "3.15.2"
+      - uses: actions/setup-go@v7.0.0
+        id: go
+        with:
+          go-version: "1.27.4"
+          cache: false
+      - uses: actions/setup-node@v7.1.0
+        id: node
+        with:
+          node-version: "26.13.0"
+      - name: Prepare Corepack
+        run: |
+          npm install --global corepack@0.36.0
+          corepack enable
+      - name: Download and patch source
+        id: source
+        env:
+          SUB2API_BUILD_STAGE: source
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          LINUX_AMD64: ${{ github.event_name != 'workflow_dispatch' || inputs.linux_amd64 }}
+          LINUX_ARM64: ${{ github.event_name != 'workflow_dispatch' || inputs.linux_arm64 }}
+          DARWIN_AMD64: ${{ github.event_name != 'workflow_dispatch' || inputs.darwin_amd64 }}
+          DARWIN_ARM64: ${{ github.event_name != 'workflow_dispatch' || inputs.darwin_arm64 }}
+          WINDOWS_AMD64: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_amd64 }}
+        run: |
+          platforms=()
+          if [[ "$LINUX_AMD64" == true ]]; then platforms+=(linux-amd64); fi
+          if [[ "$LINUX_ARM64" == true ]]; then platforms+=(linux-arm64); fi
+          if [[ "$DARWIN_AMD64" == true ]]; then platforms+=(darwin-amd64); fi
+          if [[ "$DARWIN_ARM64" == true ]]; then platforms+=(darwin-arm64); fi
+          if [[ "$WINDOWS_AMD64" == true ]]; then platforms+=(windows-amd64); fi
+          export SUB2API_BUILD_PLATFORMS="${platforms[*]}"
+          python3 scripts/build.py
+          source_sha="$(git rev-parse HEAD)"
+          printf 'source_sha=%s\n' "$source_sha" >> "$GITHUB_OUTPUT"
+      - name: Load caches
+        uses: actions/cache/restore@v6.1.0
+        id: dependencies
+        with:
+          path: |
+            ${{ env.GOMODCACHE }}
+            ${{ env.GOCACHE }}
+            ${{ env.pnpm_config_store_dir }}
+          key: dependencies-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ steps.node.outputs.node-version }}-${{ steps.source.outputs.pnpm }}-${{ hashFiles('dist/work/source/backend/go.mod', 'dist/work/source/backend/go.sum', 'dist/work/source/frontend/pnpm-lock.yaml', 'scripts/build.py') }}-${{ github.sha }}
+          restore-keys: |
+            dependencies-${{ runner.os }}-${{ runner.arch }}-${{ steps.go.outputs.go-version }}-${{ steps.node.outputs.node-version }}-${{ steps.source.outputs.pnpm }}-${{ hashFiles('dist/work/source/backend/go.mod', 'dist/work/source/backend/go.sum', 'dist/work/source/frontend/pnpm-lock.yaml', 'scripts/build.py') }}-
+      - name: Test and build selected platforms
+        env:
+          SUB2API_BUILD_STAGE: resume
+          UPSTREAM_TAG: ${{ steps.source.outputs.tag }}
+          SUB2API_BUILD_PLATFORMS: ${{ steps.source.outputs.platforms }}
+        run: python3 scripts/build.py
+      - name: Upload artifacts
+        uses: actions/github-script@v9.0.0
+        env:
+          UPSTREAM_TAG: ${{ steps.source.outputs.tag }}
+          SUB2API_BUILD_PLATFORMS: ${{ steps.source.outputs.platforms }}
+        with:
+          script: |
+            const {mkdtemp} = require('node:fs/promises');
+            const path = require('node:path');
+            const {pathToFileURL} = require('node:url');
+            const sdkDirectory = await mkdtemp(path.join(process.env.RUNNER_TEMP, 'artifact-sdk-'));
+            await exec.exec('npm', [
+              'install', '--prefix', sdkDirectory, '--no-audit', '--no-fund',
+              '--package-lock=false', '@actions/artifact@6.3.1'
+            ]);
+            const {DefaultArtifactClient} = await import(pathToFileURL(
+              path.join(sdkDirectory, 'node_modules/@actions/artifact/lib/artifact.js')
+            ).href);
+            const client = new DefaultArtifactClient();
+            for (const platform of process.env.SUB2API_BUILD_PLATFORMS.split(/\s+/)) {
+              const directory = path.join(process.env.GITHUB_WORKSPACE, 'dist', 'build', platform);
+              const suffix = platform.startsWith('windows-') ? '.exe' : '';
+              for (const component of ['', 'installer-']) {
+                const name = 'sub2api-plugins-' + component + process.env.UPSTREAM_TAG + '-' + platform + suffix;
+                await client.uploadArtifact(name, [path.join(directory, name)], directory, {skipArchive: true});
+              }
+            }
+      - name: Save caches
+        uses: actions/cache/save@v6.1.0
+        if: ${{ steps.dependencies.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            ${{ env.GOMODCACHE }}
+            ${{ env.GOCACHE }}
+            ${{ env.pnpm_config_store_dir }}
+          key: ${{ steps.dependencies.outputs.cache-primary-key }}
+      - name: Publish Release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+          UPSTREAM_TAG: ${{ steps.source.outputs.tag }}
+          SUB2API_BUILD_PLATFORMS: ${{ steps.source.outputs.platforms }}
+        run: |
+          assets=()
+          read -r -a platforms <<< "$SUB2API_BUILD_PLATFORMS"
+          for platform in "${platforms[@]}"; do
+            suffix=""
+            if [[ "$platform" == windows-* ]]; then suffix=.exe; fi
+            for component in '' installer-; do
+              assets+=("dist/build/$platform/sub2api-plugins-${component}${UPSTREAM_TAG}-${platform}${suffix}")
+            done
+          done
+          gh release delete "$UPSTREAM_TAG" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "$UPSTREAM_TAG" "${assets[@]}" \
+            --target "$SOURCE_SHA" \
+            --title "Sub2API-Plugin ${SOURCE_SHA:0:7} (v${UPSTREAM_TAG#v})" \
+            --generate-notes

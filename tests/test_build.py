@@ -343,6 +343,17 @@ class BuildTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "git submodule update --init --recursive -- plugins/alpha"):
                 build.discover_plugins(root)
 
+    def test_discover_root_tracked_plugin(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, _ = self.fixture(Path(temporary))
+            local = root / "plugins/local"
+            (local / "patches").mkdir(parents=True)
+            (local / "patches/local.patch").write_text("local patch\n")
+            self.assertEqual(
+                [path.name for path in build.discover_plugins(root)],
+                ["alpha", "local", "zeta"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

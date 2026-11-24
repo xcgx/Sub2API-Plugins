@@ -4,7 +4,7 @@
 
 Active delivery builds the selected upstream tag on Linux amd64/arm64, Darwin amd64/arm64, and Windows amd64.
 The verified integration baseline is Sub2API v0.2.24.
-Builds discover plugin submodules automatically.
+Builds discover root-tracked plugin directories and plugin submodules automatically.
 The common build downloads upstream source. Plugins own production patches, business tests, and their licenses.
 Each plugin and the template carry a complete standalone build kit. Local builds and CI both run `python3 scripts/build.py`.
 Combined builds skip empty patch sets and run common build/installer tests once.

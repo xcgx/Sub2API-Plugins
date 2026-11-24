@@ -55,19 +55,28 @@ def discover_plugins(root):
     if (root / "patches").is_dir():
         return [root]
     modules = root / ".gitmodules"
-    if not modules.is_file():
-        return []
-    result = subprocess.run(
-        ["git", "config", "--null", "--file", str(modules), "--get-regexp", r"^submodule\..*\.path$"],
-        cwd=root, text=True, capture_output=True,
-    )
-    if result.returncode not in (0, 1):
-        raise RuntimeError(result.stderr.strip())
-    paths = [entry.split("\n", 1)[1] for entry in result.stdout.split("\0") if entry]
-    plugins = sorted(path for path in paths if PurePosixPath(path).parts[0] == "plugins")
-    for path in plugins:
+    paths = []
+    if modules.is_file():
+        result = subprocess.run(
+            ["git", "config", "--null", "--file", str(modules), "--get-regexp", r"^submodule\..*\.path$"],
+            cwd=root, text=True, capture_output=True,
+        )
+        if result.returncode not in (0, 1):
+            raise RuntimeError(result.stderr.strip())
+        paths = [entry.split("\n", 1)[1] for entry in result.stdout.split("\0") if entry]
+    submodule_plugins = sorted(path for path in paths if PurePosixPath(path).parts[0] == "plugins")
+    for path in submodule_plugins:
         if not (root / path / ".git").exists():
             raise RuntimeError(f"Uninitialized submodule {path}. Run: git submodule update --init --recursive -- {path}")
+    plugin_directory = root / "plugins"
+    local_plugins = set()
+    if plugin_directory.is_dir():
+        local_plugins = {
+            path.relative_to(root).as_posix()
+            for path in plugin_directory.iterdir()
+            if path.is_dir() and (path / "patches").is_dir()
+        }
+    plugins = sorted(set(submodule_plugins) | local_plugins)
     return [root / path for path in plugins if any((root / path / "patches").glob("*.patch"))]
 
 

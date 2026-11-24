@@ -6,7 +6,7 @@ Use [administrator evaluation](./runtime-installation.md), [native inspection](.
 Delivery uses the selected upstream tag on Linux amd64/arm64, Darwin amd64/arm64, and Windows amd64.
 Sub2API v0.2.24 is the verified integration baseline.
 Installer version mismatches produce warnings and require explicit confirmation. Matching executable versions need no version prompt.
-The common build downloads upstream source and discovers initialized plugin submodules with production patches under `plugins/`.
+The common build downloads upstream source and discovers root-tracked plugin directories and initialized plugin submodules with production patches under `plugins/`.
 Each plugin and the template retain a complete aligned build kit. Local builds and CI use the same argument-free entry.
 Plugins own patches and business tests. Store new plugin assertions and support code in flat `tests/`. `assets/` contains data only.
 Keep necessary edits to existing upstream test fixtures with the native contract changes they verify.
@@ -105,14 +105,7 @@ For the signing-policy check, exit status `1` means unset. A configured value ta
 
 Task-creation consent and an earlier commit request do not replace final work-commit approval.
 
-### Fork Upstream Sync Commits
-
-`plugins/codex-candy-eval` is a fork of `haowang02/cpa-plugin-codex-candy-eval`.
-When syncing an upstream release into a fork submodule, create a two-parent Git merge commit instead of a linear commit.
-Fetch the public upstream commit without user Git credentials and record that commit as the second parent.
-Keep the native Sub2API plugin layout and keep retired CPA files removed in the merged tree.
-Verify `git rev-list --parents -n 1 HEAD` lists both the previous local commit and the synced upstream commit.
-Update the parent repository submodule pointer only after verifying the two-parent merge commit.
+Plugin source snapshots are root-tracked. Keep production patches, tests, and plugin license inputs together under `plugins/<name>/`.
 
 ### Trellis-Managed Artifacts
 

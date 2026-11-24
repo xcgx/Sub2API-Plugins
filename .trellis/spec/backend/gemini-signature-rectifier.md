@@ -4,7 +4,8 @@
 
 Use this contract when changing native Gemini signature normalization, recovery, or its administrator setting.
 The verified integration baseline is Sub2API v0.2.24.
-Owner: [production patch](../../../plugins/gemini-signature-rectifier/patches/gemini-signature-rectifier.patch).
+The root-tracked plugin snapshot currently has no production patch and is skipped by the combined build.
+Restore a reviewed upstream-compatible patch before enabling this feature.
 
 `GeminiMessagesCompatService.ForwardNative` owns normalization and recovery across four request builders:
 

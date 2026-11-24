@@ -55,7 +55,8 @@ dist/build/<os>-<arch>/sub2api-plugins-installer-<upstream-tag>-<os>-<arch>
 ## 3. Contracts
 
 Download `https://github.com/Wei-Shaw/sub2api.git` at the selected tag with depth one into a temporary workspace.
-Read plugin submodule paths under `plugins/` from `.gitmodules`. Use current checkouts without fetching or updating plugins during builds.
+Read plugin submodule paths under `plugins/` from `.gitmodules` and discover root-tracked plugin directories under `plugins/`.
+Use current checkouts without fetching or updating plugins during builds.
 Report uninitialized submodules with their initialization command.
 Sort plugins by relative path and top-level `patches/*.patch` files by filename.
 After initialization checks, skip plugins without top-level `patches/*.patch` files, including their tests and licenses.
